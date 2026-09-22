@@ -107,12 +107,49 @@ const statusConfig = {
 }
 
 function loadTasks() {
+  const stored = localStorage.getItem(STORAGE_KEY)
+  if (stored == null) return getDefaultTasks()
+
+  let parsed
   try {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    return stored ? JSON.parse(stored) : getDefaultTasks()
+    parsed = JSON.parse(stored)
   } catch (e) {
-    logger.error('加载任务失败', e)
-    return getDefaultTasks()
+    // 存储损坏：不使用默认数据覆盖（避免重复任务），安全降级为空列表
+    logger.error('任务数据解析失败，已忽略损坏数据', e)
+    return []
+  }
+
+  if (!Array.isArray(parsed)) {
+    logger.warn('任务数据结构异常，已重置为空列表')
+    return []
+  }
+
+  // 逐条过滤修复：非法条目直接丢弃；同 id 去重，保证不会出现重复任务
+  const seenIds = new Set()
+  const result = []
+  for (const item of parsed) {
+    const task = sanitizeTask(item)
+    if (!task || seenIds.has(task.id)) continue
+    seenIds.add(task.id)
+    result.push(task)
+  }
+  return result
+}
+
+/** 校验并规范化单条任务，非法记录返回 null（不影响其他任务与业务页面） */
+function sanitizeTask(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  if (typeof raw.id !== 'string' || !raw.id) return null
+  if (!taskTypeConfig[raw.type]) return null
+  if (!statusConfig[raw.status]) return null
+
+  return {
+    ...raw,
+    title: typeof raw.title === 'string' ? raw.title : '',
+    subtitle: typeof raw.subtitle === 'string' ? raw.subtitle : '',
+    amount: Number.isFinite(Number(raw.amount)) ? Number(raw.amount) : 0,
+    createdAt: typeof raw.createdAt === 'string' && raw.createdAt ? raw.createdAt : formatDate(new Date()),
+    extra: raw.extra && typeof raw.extra === 'object' ? raw.extra : {}
   }
 }
 
@@ -142,11 +179,11 @@ function getDefaultTasks() {
       id: 'T' + Date.now().toString() + '002',
       type: 'course',
       title: '台球入门基础课',
-      subtitle: '报名成功，等待开课',
+      subtitle: '学习中 · 已完成 2/8 课时',
       amount: 599,
-      status: 'upcoming',
+      status: 'ongoing',
       createdAt: formatDate(new Date(Date.now() - 259200000)),
-      extra: { courseId: 1 }
+      extra: { courseId: 1, orderNo: 'CR20260001', coach: '张明', lessons: '8课时', totalLessons: 8, completedLessons: 2, progress: 25 }
     },
     {
       id: 'T' + Date.now().toString() + '003',
@@ -196,6 +233,73 @@ function enrichTask(task) {
   }
 }
 
+/** 课程任务副标题：与学习进度保持一致 */
+function courseTaskSubtitle(completed, total) {
+  if (!total || completed <= 0) return '报名成功，等待开课'
+  if (completed >= total) return `已完成全部 ${total} 课时`
+  return `学习中 · 已完成 ${completed}/${total} 课时`
+}
+
+/** 根据报名记录生成/更新课程任务字段（不创建新 id） */
+function buildCourseTaskFields(enrollment) {
+  const total = Number(enrollment.totalLessons) || 0
+  const completed = Math.min(Math.max(0, Number(enrollment.completedLessons) || 0), total)
+  const progress = total > 0 ? Math.round((completed / total) * 100) : 0
+  const status = !total || completed <= 0 ? 'upcoming' : completed >= total ? 'completed' : 'ongoing'
+
+  return {
+    type: 'course',
+    title: enrollment.courseName,
+    subtitle: courseTaskSubtitle(completed, total),
+    amount: Number(enrollment.price) || 0,
+    status,
+    extra: {
+      courseId: Number(enrollment.courseId),
+      orderNo: enrollment.orderNo,
+      coach: enrollment.coach,
+      lessons: enrollment.lessons,
+      totalLessons: total,
+      completedLessons: completed,
+      progress
+    }
+  }
+}
+
+/**
+ * 在任务列表中幂等写入一条课程任务（按 courseId 匹配，其次 orderNo）
+ * @returns {Array} 更新后的新列表，及匹配到的任务（通过返回值）
+ */
+function upsertCourseTaskInList(tasks, enrollment) {
+  const fields = buildCourseTaskFields(enrollment)
+  const courseId = fields.extra.courseId
+  const index = tasks.findIndex(t =>
+    t.type === 'course' &&
+    (Number(t.extra?.courseId) === courseId ||
+      (fields.extra.orderNo && t.extra?.orderNo === fields.extra.orderNo))
+  )
+
+  let task
+  let list
+  if (index === -1) {
+    task = {
+      id: generateTaskId(),
+      createdAt: enrollment.createTime || formatDate(new Date()),
+      ...fields
+    }
+    list = [task, ...tasks]
+  } else {
+    task = {
+      ...tasks[index],
+      ...fields,
+      extra: { ...tasks[index].extra, ...fields.extra },
+      createdAt: tasks[index].createdAt || enrollment.createTime || formatDate(new Date())
+    }
+    list = [...tasks]
+    list[index] = task
+  }
+  return { list, task }
+}
+
 export const taskStore = {
   getAll() {
     const tasks = loadTasks()
@@ -232,6 +336,25 @@ export const taskStore = {
     saveTasks(tasks)
     logger.info('任务已添加', newTask)
     return enrichTask(newTask)
+  },
+
+  /** 幂等写入课程任务（按 courseId 匹配，存在则更新） */
+  upsertCourseTask(enrollment) {
+    const safe = {
+      courseId: enrollment.courseId,
+      orderNo: enrollment.orderNo,
+      courseName: enrollment.courseName,
+      price: enrollment.price,
+      coach: enrollment.coach,
+      lessons: enrollment.lessons,
+      totalLessons: enrollment.totalLessons,
+      completedLessons: enrollment.completedLessons ?? 0,
+      createTime: enrollment.createTime
+    }
+    const { list, task } = upsertCourseTaskInList(loadTasks(), safe)
+    saveTasks(list)
+    logger.info('课程任务已同步', { courseId: safe.courseId, orderNo: safe.orderNo })
+    return task ? enrichTask(task) : null
   },
 
   update(taskId, updates) {
@@ -286,19 +409,63 @@ export const taskStore = {
   },
 
   addCourseTask(course, enrollInfo) {
-    return this.add({
-      type: 'course',
-      title: course.name,
-      subtitle: '报名成功，等待开课',
-      amount: course.price,
-      status: 'upcoming',
-      extra: {
-        courseId: course.id,
-        orderNo: enrollInfo.orderNo,
-        coach: course.coach,
-        lessons: course.lessons
-      }
+    return this.upsertCourseTask({
+      courseId: course.id,
+      orderNo: enrollInfo?.orderNo,
+      courseName: course.name,
+      price: course.price,
+      coach: course.coach,
+      lessons: course.lessons,
+      totalLessons: Number.parseInt(String(course.lessons || '').match(/\d+/)?.[0] || '0', 10),
+      completedLessons: 0
     })
+  },
+
+  /**
+   * 将课程报名记录与任务中心同步（幂等）
+   *
+   * 规则：
+   * - 每条报名记录对应恰好一个课程任务，按 courseId 匹配（兼容旧数据无 orderNo 的情况）
+   * - 已完成课时 / 进度 / 金额 / 副标题以报名记录为准
+   * - 历史遗留的重复课程任务会被清理，支付失败/取消绝不会残留任务
+   *
+   * @param {Array} enrollments courseStore 中的全部报名记录
+   * @returns {Array} 同步后的全部任务
+   */
+  syncCourseEnrollments(enrollments) {
+    const list = Array.isArray(enrollments) ? enrollments : []
+    const tasks = loadTasks()
+    const courseIdSet = new Set(list.map(e => Number(e.courseId)))
+
+    // 删除：没有对应报名记录的课程任务（含历史重复/脏任务）
+    // 注意：报名成功后课程任务均带 orderNo；无 orderNo 的旧任务在有匹配报名时会被接管
+    let remaining = tasks.filter(t => {
+      if (t.type !== 'course') return true
+      const cid = Number(t.extra?.courseId)
+      if (!courseIdSet.has(cid)) {
+        // 没有报名记录：若任务带 orderNo（由报名流程产生）则删除，未知来源任务保留
+        return !t.extra?.orderNo
+      }
+      return true
+    })
+
+    // 按 courseId 合并：同课程只保留一个任务
+    const keptCourseIds = new Set()
+    remaining = remaining.filter(t => {
+      if (t.type !== 'course') return true
+      const cid = Number(t.extra?.courseId)
+      if (keptCourseIds.has(cid)) return false
+      keptCourseIds.add(cid)
+      return true
+    })
+
+    // 逐条 upsert 报名记录对应的任务
+    for (const enrollment of list) {
+      remaining = upsertCourseTaskInList(remaining, enrollment).list
+    }
+
+    saveTasks(remaining)
+    return remaining
   },
 
   addCompetitionTask(competition, regInfo) {

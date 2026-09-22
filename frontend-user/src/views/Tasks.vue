@@ -96,6 +96,17 @@
         <div class="task-body">
           <h3 class="task-title">{{ task.title }}</h3>
           <p class="task-subtitle">{{ task.subtitle }}</p>
+
+          <!-- 课程任务：已完成课时与学习进度，与课程列表/成功反馈一致 -->
+          <div v-if="task.type === 'course' && task.extra && task.extra.totalLessons" class="task-course-progress">
+            <div class="course-progress-bar">
+              <div class="course-progress-fill" :style="{ width: (task.extra.progress || 0) + '%' }"></div>
+            </div>
+            <span class="course-progress-text">
+              {{ task.extra.completedLessons || 0 }}/{{ task.extra.totalLessons }} 课时 · {{ task.extra.progress || 0 }}%
+            </span>
+          </div>
+
           <div class="task-meta">
             <span v-if="task.amount > 0" class="task-amount">
               ¥{{ task.amount.toLocaleString() }}
@@ -196,6 +207,10 @@
             <span class="detail-label">任务编号</span>
             <span class="detail-value">{{ selectedTask.id }}</span>
           </div>
+          <div v-if="selectedTask.extra && selectedTask.extra.orderNo" class="detail-row">
+            <span class="detail-label">订单编号</span>
+            <span class="detail-value">{{ selectedTask.extra.orderNo }}</span>
+          </div>
           <div class="detail-row">
             <span class="detail-label">任务类型</span>
             <span class="detail-value">{{ selectedTask.typeName }}</span>
@@ -204,6 +219,23 @@
             <span class="detail-label">任务描述</span>
             <span class="detail-value">{{ selectedTask.subtitle }}</span>
           </div>
+          <!-- 课程任务：学习进度详情 -->
+          <template v-if="selectedTask.type === 'course' && selectedTask.extra && selectedTask.extra.totalLessons">
+            <div class="detail-row">
+              <span class="detail-label">课程课时</span>
+              <span class="detail-value">{{ selectedTask.extra.totalLessons }} 课时</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">已完成课时</span>
+              <span class="detail-value">{{ selectedTask.extra.completedLessons || 0 }} / {{ selectedTask.extra.totalLessons }}</span>
+            </div>
+            <div class="detail-course-progress">
+              <div class="course-progress-bar">
+                <div class="course-progress-fill" :style="{ width: (selectedTask.extra.progress || 0) + '%' }"></div>
+              </div>
+              <span>{{ selectedTask.extra.progress || 0 }}%</span>
+            </div>
+          </template>
           <div v-if="selectedTask.amount > 0" class="detail-row">
             <span class="detail-label">交易金额</span>
             <span class="detail-value amount">¥{{ selectedTask.amount.toLocaleString() }}</span>
@@ -705,6 +737,41 @@ export default {
   font-size: 0.9rem;
   color: var(--text-secondary);
   margin-bottom: 0.75rem;
+}
+
+/* 课程任务学习进度 */
+.task-course-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.course-progress-bar {
+  flex: 1;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.course-progress-fill {
+  height: 100%;
+  background: var(--gradient-1);
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+.course-progress-text {
+  font-size: 0.75rem;
+  color: var(--primary);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.detail-course-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+  color: var(--primary);
+  font-weight: 500;
 }
 
 .task-meta {
