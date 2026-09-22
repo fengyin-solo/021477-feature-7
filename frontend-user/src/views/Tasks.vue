@@ -96,6 +96,15 @@
         <div class="task-body">
           <h3 class="task-title">{{ task.title }}</h3>
           <p class="task-subtitle">{{ task.subtitle }}</p>
+
+          <!-- 课程学习进度：与课程页/成功反馈保持一致 -->
+          <div v-if="task.type === 'course' && task.status !== 'pending_payment'" class="task-course-progress">
+            <div class="course-progress-bar">
+              <div class="course-progress-fill" :style="{ width: task.progress + '%' }"></div>
+            </div>
+            <span>已完成 {{ task.doneLessons }}/{{ task.lessonCount }} 课时 · {{ task.progress }}%</span>
+          </div>
+
           <div class="task-meta">
             <span v-if="task.amount > 0" class="task-amount">
               ¥{{ task.amount.toLocaleString() }}
@@ -159,6 +168,20 @@
           <span class="pay-label">应付金额</span>
           <span class="pay-amount">¥{{ selectedTask?.amount?.toLocaleString() }}</span>
         </div>
+
+        <div class="pay-method-row">
+          <span class="pay-label">支付方式</span>
+          <span>💳 模拟支付</span>
+        </div>
+
+        <div v-if="payMessage" class="pay-message" :class="payMessageType">
+          {{ payMessage }}
+        </div>
+
+        <div class="pay-demo-actions">
+          <button type="button" class="demo-link" @click="demoOutcome = 'fail'">模拟支付失败</button>
+          <button type="button" class="demo-link" @click="demoOutcome = 'cancel'">模拟取消支付</button>
+        </div>
       </div>
     </Modal>
 
@@ -207,6 +230,10 @@
           <div v-if="selectedTask.amount > 0" class="detail-row">
             <span class="detail-label">交易金额</span>
             <span class="detail-value amount">¥{{ selectedTask.amount.toLocaleString() }}</span>
+          </div>
+          <div v-if="selectedTask.type === 'course'" class="detail-row">
+            <span class="detail-label">课程进度</span>
+            <span class="detail-value">{{ selectedTask.doneLessons }}/{{ selectedTask.lessonCount }} 课时（{{ selectedTask.progress }}%）</span>
           </div>
           <div class="detail-row">
             <span class="detail-label">创建时间</span>
@@ -264,7 +291,10 @@ export default {
       toastType: 'success',
       toastTitle: '',
       toastMessage: '',
-      refreshKey: 0
+      refreshKey: 0,
+      demoOutcome: null,
+      payMessage: '',
+      payMessageType: 'error'
     }
   },
   computed: {
@@ -325,17 +355,18 @@ export default {
     },
     handleAction(task, action) {
       this.selectedTask = { ...task }
-      
+
       if (action.route) {
         this.navigateToRoute(action.route, action.key, task)
         return
       }
-      
+
       const actionMap = {
         pay: () => this.openPayModal(),
         cancel: () => this.openCancelModal(),
         view: () => this.openDetailModal(),
         remind: () => this.handleRemind(),
+        study: () => this.navigateToRoute('/courses', 'study', task),
         rebook: () => this.navigateToRoute('/tables', 'rebook', task),
         rebuy: () => this.navigateToRoute('/shop', 'rebuy', task),
         confirm: () => this.handleConfirm(),
@@ -346,7 +377,7 @@ export default {
     },
     navigateToRoute(route, actionKey, task) {
       logger.info('Navigate to business page', { route, actionKey, taskId: task.id, type: task.type })
-      
+
       const query = {}
       if (task.extra) {
         if (task.type === 'booking' && task.extra.tableId) {
@@ -362,10 +393,12 @@ export default {
           query.orderNo = task.extra.orderNo
         }
       }
-      
+
       this.$router.push({ path: route, query })
     },
     openPayModal() {
+      this.demoOutcome = null
+      this.payMessage = ''
       this.showPayModal = true
     },
     openCancelModal() {
@@ -377,14 +410,52 @@ export default {
     async confirmPay() {
       if (!this.selectedTask) return
       this.payLoading = true
-      
+      this.payMessage = ''
+
+      // 模拟支付链路延迟
       await new Promise(resolve => setTimeout(resolve, 1000))
-      
+
+      const outcome = this.demoOutcome
+      this.demoOutcome = null
+
+      if (outcome === 'cancel') {
+        this.payLoading = false
+        this.payMessageType = 'warning'
+        this.payMessage = '支付已取消，待付款订单已保留，可随时继续付款'
+        this.showNotification('info', '支付已取消', '订单已保留，不会产生重复任务')
+        return
+      }
+
+      if (outcome === 'fail') {
+        this.payLoading = false
+        this.payMessageType = 'error'
+        this.payMessage = '支付失败，请稍后重试；订单仍为待付款状态'
+        this.showNotification('error', '支付失败', '请重新支付，不会产生重复订单')
+        logger.warn('Payment failed (simulated)', { taskId: this.selectedTask.id })
+        return
+      }
+
+      // 支付前再次确认任务仍为待付款，防止中断重试造成重复入账
+      const before = taskStore.getById(this.selectedTask.id)
+      if (!before) {
+        this.payLoading = false
+        this.showPayModal = false
+        this.showNotification('error', '订单不存在', '该任务可能已被取消')
+        return
+      }
+      if (before.status !== 'pending_payment') {
+        this.payLoading = false
+        this.showPayModal = false
+        this.refreshTasks()
+        this.showNotification('info', '订单已支付', '无需重复支付')
+        return
+      }
+
       const updatedTask = taskStore.markAsPaid(this.selectedTask.id)
-      
+
       this.payLoading = false
       this.showPayModal = false
-      
+
       if (updatedTask) {
         this.refreshTasks()
         this.successTitle = '支付成功'
@@ -397,18 +468,26 @@ export default {
     },
     async confirmCancel() {
       if (!this.selectedTask) return
+
+      // 已支付的课程不能通过「取消」删除，避免名额/进度被错误清空
+      if (this.selectedTask.type === 'course' && this.selectedTask.status !== 'pending_payment') {
+        this.showCancelModal = false
+        this.showNotification('warning', '无法取消', '已支付课程请联系客服处理，学习进度不受影响')
+        return
+      }
+
       this.cancelLoading = true
-      
+
       await new Promise(resolve => setTimeout(resolve, 800))
-      
+
       const result = taskStore.remove(this.selectedTask.id)
-      
+
       this.cancelLoading = false
       this.showCancelModal = false
-      
+
       if (result) {
         this.refreshTasks()
-        this.showNotification('success', '取消成功', '任务已取消')
+        this.showNotification('success', '取消成功', this.selectedTask.type === 'course' ? '报名已取消，名额已释放' : '任务已取消')
         logger.info('Task cancelled', { taskId: this.selectedTask.id })
       } else {
         this.showNotification('error', '取消失败', '请稍后重试')
@@ -806,6 +885,85 @@ export default {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+}
+
+.task-course-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.course-progress-bar {
+  flex: 1;
+  max-width: 220px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.course-progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+
+.task-course-progress span {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.pay-method-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem 0.9rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 10px;
+  font-size: 0.88rem;
+}
+
+.pay-message {
+  padding: 0.6rem 0.9rem;
+  border-radius: 10px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.pay-message.error {
+  background: rgba(255, 107, 107, 0.1);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  color: #ff8a8a;
+}
+
+.pay-message.warning {
+  background: rgba(255, 193, 7, 0.1);
+  border: 1px solid rgba(255, 193, 7, 0.3);
+  color: #ffc107;
+}
+
+.pay-demo-actions {
+  display: flex;
+  justify-content: center;
+  gap: 1.25rem;
+}
+
+.demo-link {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0.25rem;
+}
+
+.demo-link:hover {
+  color: var(--text-secondary);
 }
 
 .pay-item,

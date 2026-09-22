@@ -24,6 +24,8 @@ const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
 
 // 任务存储（用于任务中心数据持久化）
 import { taskStore as ts } from './taskStore'
+import COURSES, { getCourseById } from './coursesData'
+import { startEnrollment, payEnrollment, PAY_RESULT } from './courseStore'
 const taskStore = ts
 
 /**
@@ -173,6 +175,7 @@ async function mockRequest(url, options) {
     '/auth/logout': handleLogout,
     '/tables': () => mockData.tables,
     '/courses': () => mockData.courses,
+    '/courses/enroll': handleCourseEnroll,
     '/competitions': () => mockData.competitions,
     '/products': () => mockData.products,
     '/user/profile': () => mockData.user,
@@ -264,6 +267,48 @@ function handleOrders(options) {
 }
 
 /**
+ * 处理课程报名请求
+ * 名额校验与幂等由 courseStore 统一保证：
+ * - 名额已满：返回 full 错误，不创建任务
+ * - 重复报名：返回已有报名记录，不产生重复任务
+ * - paymentOutcome 可为 success/fail/cancel，用于模拟支付结果
+ */
+async function handleCourseEnroll(options) {
+  const body = JSON.parse(options.body || '{}')
+  const course = getCourseById(body.courseId)
+  if (!course) {
+    throw new Error('课程不存在')
+  }
+
+  const started = startEnrollment(course)
+  if (!started.ok) {
+    if (started.reason === 'full') {
+      throw new Error('课程名额已满')
+    }
+    // duplicated：已有报名，直接返回对应状态
+    return {
+      orderNo: started.enrollment.orderNo,
+      courseId: course.id,
+      status: started.enrollment.status,
+      duplicated: true
+    }
+  }
+
+  const payResult = await payEnrollment(started.enrollment.id, body.paymentOutcome || PAY_RESULT.SUCCESS)
+  if (!payResult.ok) {
+    if (payResult.reason === 'cancelled') throw new Error('支付已取消')
+    throw new Error('支付失败，请稍后继续付款')
+  }
+
+  return {
+    orderNo: payResult.enrollment.orderNo,
+    courseId: course.id,
+    status: payResult.enrollment.status,
+    progress: payResult.enrollment.progress
+  }
+}
+
+/**
  * 处理任务中心相关请求
  * GET: 返回用户所有任务（整合预约、报名、订单）
  * POST: 执行任务操作（支付、取消等）
@@ -329,11 +374,8 @@ const mockData = {
     { id: 6, name: '6号球桌', type: '中式八球', typeId: 'chinese', price: 50, available: true, size: '9尺', brand: '乔氏' }
   ],
   
-  // 课程列表
-  courses: [
-    { id: 1, name: '台球入门基础课', icon: '🎯', level: '入门', duration: '4周', lessons: '8课时', students: 156, price: 599, originalPrice: 799, description: '从零开始学习台球', coach: '张明', coachTitle: '高级教练', gradient: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' },
-    { id: 2, name: '斯诺克进阶训练', icon: '🎱', level: '进阶', duration: '6周', lessons: '12课时', students: 89, price: 1299, originalPrice: 1599, description: '深入学习斯诺克战术', coach: '李强', coachTitle: '国家级教练', gradient: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)' }
-  ],
+  // 课程列表（与课程页共用同一份目录数据，保证价格/名额一致）
+  courses: COURSES,
   
   // 赛事列表
   competitions: [
